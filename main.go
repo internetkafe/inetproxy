@@ -8,10 +8,18 @@ import (
     "os"
     "os/signal"
     "strings"
+    "sync"
     "syscall"
     "time"
-
+    "os/exec"
     "github.com/joho/godotenv"
+)
+
+var (
+    activeProxies []map[string]interface{}
+    spareProxies  []map[string]interface{}
+    xrayCmd       *exec.Cmd
+    proxyMutex    sync.Mutex
 )
 
 func main() {
@@ -27,12 +35,16 @@ func main() {
     xrayBin := getEnv("XRAY_BIN", "xray")
     startPort := 10001
     maxProxies := 0
+    recheckInterval := 0
 
     if p := os.Getenv("START_PORT"); p != "" {
         fmt.Sscanf(p, "%d", &startPort)
     }
     if m := os.Getenv("MAX_PROXIES"); m != "" {
         fmt.Sscanf(m, "%d", &maxProxies)
+    }
+    if r := os.Getenv("RECHECK_INTERVAL"); r != "" {
+        fmt.Sscanf(r, "%d", &recheckInterval)
     }
 
     if socksUser == "" || socksPass == "" {
@@ -48,41 +60,102 @@ func main() {
         XrayBin:    xrayBin,
     }
 
-    workingOutbounds := w.Run()
+    working, spares := w.Run()
 
-    if len(workingOutbounds) == 0 {
+    if len(working) == 0 {
         log.Fatal("Живых прокси не найдено.")
     }
 
-    if maxProxies > 0 && len(workingOutbounds) > maxProxies {
-        workingOutbounds = workingOutbounds[:maxProxies]
-    }
+    proxyMutex.Lock()
+    activeProxies = working
+    spareProxies = spares
+    proxyMutex.Unlock()
 
-    finalConfig := buildXrayConfig(workingOutbounds, startPort, socksUser, socksPass)
+    finalConfig := buildXrayConfig(activeProxies, startPort, socksUser, socksPass)
     finalFile := "final_config.json"
     saveConfig(finalConfig, finalFile)
 
     serverIP := getPublicIP()
 
     log.Println("Запуск финального Xray-core с рабочими прокси...")
-    go startXrayFinal(finalFile, xrayBin)
+    xrayCmd = startXrayFinal(finalFile, xrayBin)
     time.Sleep(2 * time.Second)
 
-    fmt.Println("\n==========================================")
-    fmt.Println("InetProxy: 🚀 Запуск успешен!")
-    fmt.Printf("Логин: %s | Пароль: %s\n", socksUser, socksPass)
-    fmt.Println("Список рабочих SOCKS5 прокси (IP:PORT):")
-    fmt.Println("==========================================")
-    for i := range workingOutbounds {
-        fmt.Printf("%s:%d\n", serverIP, startPort+i)
+    printProxies(activeProxies, serverIP, startPort, socksUser, socksPass)
+
+    if recheckInterval > 0 {
+        log.Printf("Включена перепроверка каждые %d секунд.", recheckInterval)
+        go startMaintenanceLoop(recheckInterval, startPort, socksUser, socksPass, xrayBin, maxProxies, serverIP)
+    } else {
+        log.Println("Перепроверка отключена (RECHECK_INTERVAL=0).")
     }
-    fmt.Println("==========================================")
+
     fmt.Println("Нажмите Ctrl+C для остановки.")
 
     sigChan := make(chan os.Signal, 1)
     signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
     <-sigChan
     log.Println("\nОстановка...")
+}
+
+func printProxies(proxies []map[string]interface{}, serverIP string, startPort int, user, pass string) {
+    fmt.Println("\n==========================================")
+    fmt.Println("InetProxy: 🚀 Активные прокси:")
+    fmt.Printf("Логин: %s | Пароль: %s\n", user, pass)
+    fmt.Println("==========================================")
+    for i := range proxies {
+        fmt.Printf("%s:%d\n", serverIP, startPort+i)
+    }
+    fmt.Println("==========================================")
+}
+
+func startMaintenanceLoop(interval, startPort int, user, pass, bin string, maxProxies int, serverIP string) {
+    for {
+        time.Sleep(time.Duration(interval) * time.Second)
+        log.Println("Запуск перепроверки прокси...")
+
+        proxyMutex.Lock()
+        
+        status := checkProxiesStatus(activeProxies, startPort, user, pass)
+        
+        var newActive []map[string]interface{}
+        deadCount := 0
+        replacedCount := 0
+
+        for i, p := range activeProxies {
+            if status[i] {
+                newActive = append(newActive, p)
+            } else {
+                deadCount++
+                if len(spareProxies) > 0 {
+                    newActive = append(newActive, spareProxies[0])
+                    spareProxies = spareProxies[1:]
+                    replacedCount++
+                }
+            }
+        }
+
+        if deadCount > 0 {
+            log.Printf("Обнаружено %d мертвых прокси. Заменено %d из запасов.", deadCount, replacedCount)
+            activeProxies = newActive
+
+            if xrayCmd != nil && xrayCmd.Process != nil {
+                xrayCmd.Process.Kill()
+                xrayCmd.Wait()
+            }
+
+            finalConfig := buildXrayConfig(activeProxies, startPort, user, pass)
+            saveConfig(finalConfig, "final_config.json")
+            xrayCmd = startXrayFinal("final_config.json", bin)
+            time.Sleep(2 * time.Second)
+
+            printProxies(activeProxies, serverIP, startPort, user, pass)
+        } else {
+            log.Println("Все активные прокси живы.")
+        }
+
+        proxyMutex.Unlock()
+    }
 }
 
 func getPublicIP() string {
