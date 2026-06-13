@@ -6,6 +6,7 @@ import (
     "net"
     "net/http"
     "time"
+
     "golang.org/x/net/proxy"
 )
 
@@ -61,4 +62,26 @@ func checkProxiesParallel(outbounds []map[string]interface{}, startPort int, use
         }
     }
     return workingOutbounds
+}
+
+// Новая функция для перепроверки: возвращает map[индекс]жив_ли
+func checkProxiesStatus(outbounds []map[string]interface{}, startPort int, user, pass string) map[int]bool {
+    type result struct {
+        index   int
+        isAlive bool
+    }
+    resultsChan := make(chan result, len(outbounds))
+    status := make(map[int]bool)
+
+    for i := range outbounds {
+        go func(idx int) {
+            resultsChan <- result{index: idx, isAlive: checkSingleProxy(startPort+idx, user, pass)}
+        }(i)
+    }
+
+    for i := 0; i < len(outbounds); i++ {
+        res := <-resultsChan
+        status[res.index] = res.isAlive
+    }
+    return status
 }
